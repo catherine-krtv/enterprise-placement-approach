@@ -22,6 +22,8 @@ The method involves:
 Each folder in the repository corresponds to a particular sector, providing customized scoring models and assessment guidelines.
 
 # Folder Structure
-automotive/ — Focuses on criteria essential for the automotive sector, such as proximity to suppliers and assembly plants.
-pharmacy/ — Emphasizes requirements for pharmaceutical industries, including clean environment standards and logistical needs.
-shipbuilding/ — Concentrates on access to ports, water depths, and heavy industry requirements for shipbuilding.
+automotive — Focuses on criteria essential for the automotive sector, such as proximity to suppliers and assembly plants.
+
+pharmacy — Emphasizes requirements for pharmaceutical industries, including clean environment standards and logistical needs.
+
+shipbuilding — Concentrates on access to ports, water depths, and heavy industry requirements for shipbuilding.
