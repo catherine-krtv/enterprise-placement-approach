@@ -1,0 +1,315 @@
+pip install mapclassify
+
+import geopandas as gpd
+import pandas as pd
+import dask.dataframe as dd
+from dask.diagnostics import ProgressBar
+from shapely.geometry import Point, Polygon
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import dask
+from mapclassify import classify
+import numpy as np
+import math
+
+# defining sanitary zones based on class of danger
+sanitary_zones = {
+    '1': 1000,
+    '2': 500,
+    '3': 300,
+    '4': 100,
+    '5': 50
+}
+
+# industry classification based on danger class
+industry_danger_class = {
+    "chemical": 1,
+    "nuclear": 1,
+    "oil": 1,
+    "gas": 1,
+    "metal production": 2,
+    "mining": 2,
+    "powerplant": 2,
+    "paper": 2,
+    "textile (hazardous)": 2,
+    "food industry": 3,
+    "mechanical engineering": 3,
+    "construction": 3,
+    "pharmacy": 3,
+    "furniture manufacturing": 4,
+    "textile (non-hazardous)": 4,
+    "retail": 4,
+    "transport": 4,
+    "logistics": 4,
+    "shipbuilding": 4,
+    "agriculture": 5,
+    "clean services": 5,
+    "education": 5
+
+}
+
+# setting CRS
+local_crs = 32636
+
+# loading files faster
+def load_geojson(file_path):
+    gdf = gpd.read_file(file_path).to_crs(local_crs)
+    print(f"Loaded {file_path}, shape: {gdf.shape}")
+    return gdf
+
+
+def hex_grid(target_gdf, target_area, id_prefix="hex"):
+    hexes = []
+    uid = 0
+    edge_length = math.sqrt((2 * target_area) / (3 * math.sqrt(3)))
+    for idx, row in target_gdf.iterrows():
+        geom = row.geometry
+        if not geom.is_valid:
+          geom = geom.buffer(0)
+        name = row.get('name', f"plot_{idx}")
+        minx, miny, maxx, maxy = geom.bounds
+        dx = 3/2 * edge_length
+        dy = math.sqrt(3) * edge_length
+
+        cols = int((maxx - minx) / dx) + 3
+        rows = int((maxy - miny) / dy) + 3
+
+        for i in range(cols):
+            for j in range(rows):
+                x = minx + i * dx
+                y = miny + j * dy
+
+                if i % 2 == 1:
+                    y += dy / 2
+
+                hex_center = (x, y)
+                hexagon = Polygon([
+                    (
+                        x + edge_length * math.cos(math.radians(angle)),
+                        y + edge_length * math.sin(math.radians(angle))
+                    )
+                    for angle in range(0, 360, 60)
+                ])
+
+                if geom.intersects(hexagon):
+                    intersected_hex = geom.intersection(hexagon)
+                    if not intersected_hex.is_empty:
+                        hexes.append({
+                            "hex_id": f"{id_prefix}_{uid}",
+                            "territory": name,
+                            "geometry": intersected_hex
+                        })
+                        uid += 1
+
+    return gpd.GeoDataFrame(hexes, crs=local_crs)
+
+
+# filter by landuse (we can use it when we have different functional zones from, for example, general plan, and we are filtering by the name of landuse)
+def filter_suitable_landuse(landuse_gdf, allowed_types):
+    filtered = landuse_gdf[landuse_gdf['LANDUSE'].isin(allowed_types)]
+    print(f"Filtered landuse, shape: {filtered.shape}")
+    return filtered.reset_index(drop=True)
+
+
+def score_buffer(target_gdf, reference_gdf, buffer):
+    target_gdf = target_gdf.copy()
+    if "hex_id" not in target_gdf.columns:
+        target_gdf["hex_id"] = target_gdf.index
+
+# hexes centroids
+    centroids = target_gdf.geometry.centroid
+    def min_distance(centroid):
+        return reference_gdf.geometry.distance(centroid).min()
+    target_gdf["min_distance"] = centroids.apply(min_distance)
+
+# score based on exponential decay — 0.8 at ~200m, 1.0 at 0m, fades to 0 at >1km
+    def proximity_score(distance):
+        if distance <= buffer:
+            return np.exp(-distance / 894.43)
+        else:
+            return 0
+
+    target_gdf["buffer_score"] = target_gdf["min_distance"].apply(proximity_score)
+    target_gdf.drop(columns=["min_distance"], inplace=True)
+
+    return target_gdf
+
+# calculating proximity to objects function
+def calculate_proximity(target_gdf, reference_gdf):
+    if reference_gdf is None or reference_gdf.empty:
+        print("Skipping proximity calculation due to missing data")
+        return pd.Series([float('inf')] * len(target_gdf))
+
+    return target_gdf.geometry.apply(lambda x: reference_gdf.distance(x).min()/1000)
+
+def create_sanitary_zone(enterprise_location, industry_type):
+    danger_class = industry_danger_class.get(industry_type, "5")
+    buffer_distance = sanitary_zones.get(danger_class, 50)
+    return enterprise_location.buffer(buffer_distance)
+
+def check_aspect_ratio(land_geometry, min_ratio=0.5, max_ratio=2.0):
+    minx, miny, maxx, maxy = land_geometry.bounds
+    width = maxx - minx
+    length = maxy - miny
+    aspect_ratio = width / length if length != 0 else float('inf')
+    return min_ratio <= aspect_ratio <= max_ratio
+
+
+def get_nearest_density(suitable_row, population):
+    nearest_idx = population.geometry.distance(suitable_row.geometry).idxmin()
+    return population.loc[nearest_idx, 'density']
+
+# Min-Max normalization to scale between 0 and 1
+def normalize_series(series):
+    return (series - series.min()) / (series.max() - series.min()) if series.max() != series.min() else series
+
+from dask import compute, delayed
+
+def rank_locations(suitable_land, roads, population, industry, railway, ports, bus_stops, metro_stations, support_infra, waterfront, pipelines, powerlines, enterprise_area, existing_buildings, industry_type, nature):
+    tqdm.pandas(desc="Calculating Proximity")
+
+    danger_class_value = industry_danger_class.get(industry_type, 5)
+
+    # Filter out land plots based on the max_class in the GeoJSON
+    suitable_land = suitable_land[suitable_land['max class'] <= danger_class_value]
+    print(f"Filtered land based on danger class, remaining shape: {suitable_land.shape}")
+
+    suitable_land = suitable_land.reset_index(drop=True)
+    print("Checking for duplicate indices in suitable_land:", suitable_land.index.duplicated().sum())
+
+    suitable_land = hex_grid(suitable_land, target_area=60000)
+
+    with ProgressBar():
+        # Delayed proximity calculations
+        road_proximity = delayed(calculate_proximity)(suitable_land, roads)
+        industry_proximity = delayed(calculate_proximity)(suitable_land, industry)
+        railway_proximity = delayed(calculate_proximity)(suitable_land, railway)
+        ports_proximity = delayed(calculate_proximity)(suitable_land, ports)
+        support_infra_proximity = delayed(calculate_proximity)(suitable_land, support_infra)
+        pipelines_proximity = delayed(calculate_proximity)(suitable_land, pipelines)
+        powerlines_proximity = delayed(calculate_proximity)(suitable_land, powerlines)
+        bus_stop_proximity = delayed(score_buffer)(suitable_land, bus_stops, buffer=1000)
+        metro_station_proximity = delayed(score_buffer)(suitable_land, metro_stations, buffer=2000)
+        waterfront_proximity = delayed(score_buffer)(suitable_land, waterfront, buffer=300)
+        nature_proximity = delayed(score_buffer)(suitable_land, nature, buffer=1000)
+
+
+        # Compute all delayed values at once
+        (
+            road_proximity, industry_proximity, railway_proximity,
+            ports_proximity, support_infra_proximity, pipelines_proximity, powerlines_proximity,
+            bus_stop_proximity, metro_station_proximity, waterfront_proximity,
+            nature_proximity
+        ) = compute(
+            road_proximity,industry_proximity, railway_proximity,
+            ports_proximity, support_infra_proximity, pipelines_proximity, powerlines_proximity,
+            bus_stop_proximity, metro_station_proximity, waterfront_proximity,
+            nature_proximity
+        )
+
+        suitable_land['population_density'] = suitable_land.apply(lambda row: get_nearest_density(row, population), axis=1)
+
+        # Assign computed values back to DataFrame
+        suitable_land['road_proximity'] = road_proximity
+        suitable_land['industry_proximity'] = industry_proximity
+        suitable_land['railway_proximity'] = railway_proximity
+        suitable_land['ports_proximity'] = ports_proximity
+        suitable_land['support_infra_proximity'] = support_infra_proximity
+        suitable_land['pipelines_proximity'] = pipelines_proximity
+        suitable_land['powerlines_proximity'] = powerlines_proximity
+        suitable_land['bus_stop_proximity'] = bus_stop_proximity['buffer_score']
+        suitable_land['metro_station_proximity'] = metro_station_proximity['buffer_score']
+        suitable_land['waterfront_proximity'] = waterfront_proximity['buffer_score']
+        suitable_land['nature_proximity'] = nature_proximity['buffer_score']
+
+        suitable_land['road_proximity'] = normalize_series(1 / (suitable_land['road_proximity'] + 1)).round(3)
+        suitable_land['population_density'] = normalize_series(suitable_land['population_density']).round(3)
+        suitable_land['industry_proximity'] = normalize_series(1 / (suitable_land['industry_proximity'] + 1)).round(3)
+        suitable_land['railway_proximity'] = normalize_series(1 / (suitable_land['railway_proximity'] + 1)).round(3)
+        suitable_land['ports_proximity'] = normalize_series(1 / (suitable_land['ports_proximity'] + 1)).round(3)
+        suitable_land['support_infra_proximity'] = normalize_series(1 / (suitable_land['support_infra_proximity'] + 1)).round(3)
+        suitable_land['pipelines_proximity'] = normalize_series(1 / (suitable_land['pipelines_proximity'] + 1)).round(3)
+        suitable_land['powerlines_proximity'] = normalize_series(1 / (suitable_land['powerlines_proximity']+1)).round(3)
+        suitable_land['bus_stop_proximity'] = normalize_series(suitable_land['bus_stop_proximity']).round(3)
+        suitable_land['metro_station_proximity'] = normalize_series(suitable_land['metro_station_proximity']).round(3)
+        suitable_land['waterfront_proximity'] = normalize_series(waterfront_proximity['buffer_score']).round(3)
+        suitable_land['nature_proximity'] = normalize_series(nature_proximity['buffer_score']).round(3)
+
+
+        # Calculate additional scores
+        suitable_land['public_transport_score'] = (
+            (suitable_land['bus_stop_proximity'] * 0.7) +
+            (suitable_land['metro_station_proximity'] * 0.3)
+        )
+
+        suitable_land['communication_proximity'] = (
+            (suitable_land['pipelines_proximity'] * 0.5) +
+            (suitable_land['powerlines_proximity'] * 0.5)
+        )
+
+        # Filtering based on constraints
+        suitable_land = suitable_land[suitable_land['geometry'].area >= enterprise_area]
+        #suitable_land = suitable_land[suitable_land.geometry.progress_apply(check_aspect_ratio)]
+        #suitable_land = suitable_land[~suitable_land.geometry.intersects(existing_buildings.unary_union)]
+
+        # filtering by shipbuilding
+        if industry_type == 'shipbuilding':
+          suitable_land = suitable_land[suitable_land['waterfront_proximity'] >= 0.8]
+          print(f"Filtered land based on waterfront proximity, remaining shape: {suitable_land.shape}")
+
+        # filtering by nature
+        if industry_danger_class.get(industry_type, 5) in [1, 2, 3, 4]:
+            suitable_land = suitable_land[nature_proximity['buffer_score'] < 0.6]  # Adjust this based on the nature proximity
+            print(f"Filtered land based on nature reserves proximity, remaining shape: {suitable_land.shape}")
+
+        #suitable_land['sanitary_zone'] = suitable_land.geometry.progress_apply(lambda x: create_sanitary_zone(x, industry_type))
+
+        # Compute final score
+        suitable_land['score'] = (
+            (suitable_land['road_proximity'] * 0.2031) +
+            (suitable_land['population_density'] * 0.0469) +
+            (suitable_land['communication_proximity'] * 0.0781) +
+            (suitable_land['industry_proximity'] * 0.1719) +
+            (suitable_land['railway_proximity'] * 0.0881) +
+            (suitable_land['ports_proximity'] * 0.2031) +
+            (suitable_land['public_transport_score'] * 0.1719) +
+            (suitable_land['support_infra_proximity'] * 0.0781)
+        )
+
+    return suitable_land.sort_values(by='score', ascending=False)
+
+
+
+def main(enterprise_area, industry_type):
+    tqdm.pandas()
+
+    landuse = load_geojson('landplots.geojson')
+    roads = load_geojson('roads.geojson')
+    population = load_geojson('population.geojson')
+    pipelines = load_geojson('pipelines.geojson')
+    powerlines = load_geojson('powerlines.geojson')
+    industry = load_geojson('industry.geojson')
+    railway = load_geojson('railway.geojson')
+    ports = load_geojson('ports.geojson')
+    bus_stops = load_geojson('bus_stops.geojson')
+    metro_stations = load_geojson('metro_future.geojson')
+    support_infra = load_geojson('support_infra.geojson')
+    existing_buildings = load_geojson('buildings.geojson')
+    waterfront = load_geojson('waterfront.geojson')
+    nature = load_geojson('nature.geojson')
+
+    allowed_landuse_types = ['industrial']
+
+
+    suitable_land = filter_suitable_landuse(landuse, allowed_landuse_types)
+    print("Checking for duplicate indices in main:", suitable_land.index.duplicated().sum())
+
+    ranked_locations = rank_locations(suitable_land, roads, population, industry, railway, ports, bus_stops, metro_stations, support_infra, waterfront, pipelines, powerlines, enterprise_area, existing_buildings, industry_type, nature)
+    print(ranked_locations[['score']].head(10))
+    display(ranked_locations.explore(column="score", cmap="Blues", legend=True))
+
+    #ranked_locations = ranked_locations.set_geometry("geometry")
+    #ranked_locations = ranked_locations.drop(columns=["sanitary_zone"])
+    ranked_locations.to_file("ship_metro.geojson", driver="GeoJSON")
+
+main(5000, 'shipbuilding')
