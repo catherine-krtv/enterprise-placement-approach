@@ -26,4 +26,4 @@ automotive — Focuses on criteria essential for the automotive sector, such as 
 
 pharmacy — Emphasizes requirements for pharmaceutical industries, including clean environment standards and logistical needs.
 
-shipbuilding — Concentrates on access to ports, water depths, and heavy industry requirements for shipbuilding.
+shipbuilding — Concentrates on access to ports and heavy industry requirements for shipbuilding.
