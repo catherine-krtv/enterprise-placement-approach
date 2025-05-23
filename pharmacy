@@ -269,14 +269,14 @@ def rank_locations(suitable_land, roads, population, industry, railway, ports, b
 
         # compute final score
         suitable_land['score'] = (
-            (suitable_land['road_proximity'] * 0.2344) +
-            (suitable_land['population_density'] * 0.1406) +
-            (suitable_land['communication_proximity'] * 0.1406) +
-            (suitable_land['industry_proximity'] * 0.1094) +
-            (suitable_land['railway_proximity'] * 0.0469) +
-            (suitable_land['ports_proximity'] * 0.0469) +
-            (suitable_land['public_transport_score'] * 0.2031) +
-            (suitable_land['support_infra_proximity'] * 0.0781)
+            (suitable_land['road_proximity'] * 0.210) +
+            (suitable_land['population_density'] * 0.088) +
+            (suitable_land['communication_proximity'] * 0.193) +
+            (suitable_land['industry_proximity'] * 0.092) +
+            (suitable_land['railway_proximity'] * 0.079) +
+            (suitable_land['ports_proximity'] * 0.099) +
+            (suitable_land['public_transport_score'] * 0.164) +
+            (suitable_land['support_infra_proximity'] * 0.075)
         )
 
     return suitable_land.sort_values(by='score', ascending=False)
@@ -313,7 +313,7 @@ def main(enterprise_area, industry_type):
 
     #ranked_locations = ranked_locations.set_geometry("geometry")
     #ranked_locations = ranked_locations.drop(columns=["sanitary_zone"])
-    ranked_locations.to_file("ranked_landplots.geojson", driver="GeoJSON")
+    ranked_locations.to_file("ranked_pharmacy.geojson", driver="GeoJSON")
 
 # using the main function
 main(5000, 'pharmacy')
